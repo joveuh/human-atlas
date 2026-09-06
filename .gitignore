@@ -1,0 +1,41 @@
+# secrets + AI-context files
+.env
+.env.local
+.env.production
+.env.example
+.claude/
+.vscode/
+.idea/
+AGENTS.md
+CLAUDE.md
+.cursorrules
+ARCHITECTURE.md
+BLOG.md
+DEPLOY.md
+HANDOFF.md
+
+# build / deps / cache
+node_modules
+dist
+.cache/
+.deploy/
+*.log
+.DS_Store
+
+# promo video production (marketing scratch, not app source or "served" media —
+# the rendered clips are already blocked by the media guardrail below; this also
+# drops the surrounding capture/design-token/AI-scaffold files around them)
+/videos/
+
+# media guardrail — served assets under public/ stay tracked
+*.mp4
+*.mov
+*.webm
+*.wav
+*.mp3
+*.m4a
+*.zip
+!public/**
+
+# generated atlas data (rebuild with: npm run data) — must come AFTER the !public/** negation
+public/data/

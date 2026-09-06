@@ -1,0 +1,30 @@
+{
+  "name": "human-atlas",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "data": "node scripts/build-data.mjs",
+    "data:stats": "node scripts/build-data.mjs --stats",
+    "record-tour": "node scripts/record-tour.mjs --headed",
+    "deploy": "node scripts/deploy.mjs"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/three": "^0.170.0",
+    "@vitejs/plugin-react": "^4.3.3",
+    "meshoptimizer": "^1.2.0",
+    "playwright-core": "^1.50.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.0"
+  }
+}
