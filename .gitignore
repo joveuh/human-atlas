@@ -16,7 +16,6 @@ HANDOFF.md
 
 # build / deps / cache
 node_modules
-dist
 .cache/
 .deploy/
 *.log
