@@ -1,24 +1,26 @@
 #!/usr/bin/env node
 // Canonical one-shot deploy for human-atlas.
 //
-// This app is 100% static (Vite build + a generated data pack under public/data/).
-// There is no Lambda, no API Gateway, no database — so unlike the fleet's SAM+Amplify
-// clones under demos/, there is no CloudFormation/SAM stack here. The whole deploy is
-// one AWS Amplify Hosting app, driven directly by this script via "manual" deployment
-// (build here, zip it, hand the zip to Amplify) — no GitHub connection required.
+// This app is 100% static — no Lambda, no API, no CloudFormation/SAM stack. It is deployed as
+// one git-connected AWS Amplify Hosting app (name "human-atlas", repo github.com/joveuh/human-atlas)
+// that auto-builds on every push to `main`. Amplify's buildSpec on that app runs
+// `npm run data` (skipped once the dataset is cached) then `npm run build` — the data pack is
+// generated fresh in Amplify's build container, never committed to git.
+//
+// `npm run deploy` does the part a plain `git push` can't: build + smoke-gate locally FIRST so a
+// broken build never reaches Amplify, then pushes `main` (the actual trigger for Amplify's own
+// from-source rebuild), then watches the job it triggers and reports the live URL.
 //
 // Usage:
-//   npm run deploy            build + deploy to Amplify Hosting, print the live URL
-//   npm run deploy -- --dry-run   build + zip only, skip every AWS call
-//   node scripts/deploy.mjs --destroy   delete the Amplify app (asks to confirm the name)
+//   npm run deploy                smoke-build, push to main, watch the triggered Amplify job
+//   npm run deploy -- --dry-run   smoke-build only — no git push, no AWS calls
+//   node scripts/deploy.mjs --destroy   print (never run) the app-delete command
 //
-// Requires: the AWS CLI, already configured (`aws sts get-caller-identity` must work).
-// Region/profile come from your normal AWS CLI configuration (AWS_REGION / AWS_PROFILE
-// / `aws configure`) — this script never hardcodes one.
+// Requires: the AWS CLI, already configured (`aws sts get-caller-identity` must work), and a
+// clean git working tree with `origin` pointed at the connected GitHub repo.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, mkdirSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -26,7 +28,6 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const APP_NAME = "human-atlas"; // this project's own name — not an invented external identifier
 const BRANCH = "main";
 const DIST = path.join(ROOT, "dist");
-const ZIP = path.join(ROOT, ".deploy", "dist.zip");
 
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
@@ -49,7 +50,7 @@ function requireAwsCli() {
   try {
     const id = aws(["sts", "get-caller-identity"]);
     log(`AWS account ${id.Account}, identity ${id.Arn}`);
-  } catch (e) {
+  } catch {
     console.error(
       "[deploy] `aws sts get-caller-identity` failed — the AWS CLI is not configured in " +
         "this shell. Run `aws configure` (or set AWS_PROFILE) and try again.",
@@ -74,15 +75,7 @@ function build() {
   if (!/\/assets\/.+\.js/.test(html)) throw new Error("dist/index.html has no /assets/*.js bundle reference");
   if (!existsSync(path.join(DIST, "data/atlas.bin"))) throw new Error("dist/data/atlas.bin missing (public/ was not copied into the build)");
   log("build smoke gate passed: index.html mounts #root, a hashed JS bundle exists, the data pack is present");
-}
-
-function zipDist() {
-  mkdirSync(path.dirname(ZIP), { recursive: true });
-  rmSync(ZIP, { force: true });
-  log(`zipping dist/ → ${path.relative(ROOT, ZIP)}`);
-  sh("zip", ["-r", "-X", "-q", ZIP, "."], { cwd: DIST });
-  const kb = Math.round(readFileSync(ZIP).length / 1024);
-  log(`zip is ${kb} KB`);
+  log("(this local dist/ is a smoke test only — Amplify rebuilds from the pushed source, it does not use this folder)");
 }
 
 function findApp() {
@@ -90,51 +83,49 @@ function findApp() {
   return apps.find((a) => a.name === APP_NAME) ?? null;
 }
 
-function ensureApp() {
-  let app = findApp();
-  if (app) {
-    log(`found existing Amplify app "${APP_NAME}" (${app.appId})`);
-    return app;
-  }
-  log(`no Amplify app named "${APP_NAME}" yet — creating one (manual deploy, no repository)`);
-  const created = aws(["amplify", "create-app", "--name", APP_NAME, "--platform", "WEB"]);
-  return created.app;
+function latestJobId(appId) {
+  const { jobSummaries } = aws(["amplify", "list-jobs", "--app-id", appId, "--branch-name", BRANCH, "--max-results", "1"]);
+  return jobSummaries[0]?.jobId ?? null;
 }
 
-function ensureBranch(appId) {
-  let branches;
-  try {
-    branches = aws(["amplify", "list-branches", "--app-id", appId]).branches;
-  } catch {
-    branches = [];
+function ensureCleanTree() {
+  const status = sh("git", ["status", "--porcelain"]);
+  if (status.trim()) {
+    throw new Error(
+      "working tree has uncommitted changes — deploy pushes to origin/main, it does not " +
+        "commit for you. Commit your changes first, then run `npm run deploy` again.",
+    );
   }
-  if (branches.some((b) => b.branchName === BRANCH)) {
-    log(`branch "${BRANCH}" already exists`);
+}
+
+function push() {
+  log(`pushing ${BRANCH} to origin (this is what actually triggers Amplify's rebuild)`);
+  const out = sh("git", ["push", "origin", BRANCH]);
+  return !/Everything up-to-date/.test(out);
+}
+
+async function watchNewJob(appId, beforeJobId, pushed) {
+  if (!pushed) {
+    log("nothing new to push — origin/main already matches. Reporting the most recent job instead of waiting for a new one.");
     return;
   }
-  log(`creating branch "${BRANCH}"`);
-  aws(["amplify", "create-branch", "--app-id", appId, "--branch-name", BRANCH, "--stage", "PRODUCTION"]);
-}
-
-async function deploy(appId) {
-  log("creating a manual deployment job");
-  const { jobId, zipUploadUrl } = aws([
-    "amplify", "create-deployment", "--app-id", appId, "--branch-name", BRANCH,
-  ]);
-  log(`uploading ${path.relative(ROOT, ZIP)}`);
-  const body = await readFile(ZIP);
-  const res = await fetch(zipUploadUrl, { method: "PUT", body });
-  if (!res.ok) throw new Error(`zip upload failed: HTTP ${res.status}`);
-  log("upload complete — starting the deployment");
-  aws(["amplify", "start-deployment", "--app-id", appId, "--branch-name", BRANCH, "--job-id", jobId]);
-
-  for (;;) {
+  log("waiting for the push to reach GitHub and trigger an Amplify build…");
+  let jobId = beforeJobId;
+  for (let i = 0; i < 30 && jobId === beforeJobId; i++) {
     await new Promise((r) => setTimeout(r, 4000));
+    jobId = latestJobId(appId);
+  }
+  if (jobId === beforeJobId) {
+    log("no new job appeared after ~2 minutes — check the Amplify console; the webhook may be delayed.");
+    return;
+  }
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 5000));
     const { job } = aws(["amplify", "get-job", "--app-id", appId, "--branch-name", BRANCH, "--job-id", jobId]);
     const status = job.summary.status;
     log(`job ${jobId}: ${status}`);
     if (status === "SUCCEED") return;
-    if (["FAILED", "CANCELLED"].includes(status)) throw new Error(`Amplify job ended with status ${status}`);
+    if (["FAILED", "CANCELLED"].includes(status)) throw new Error(`Amplify job ${jobId} ended with status ${status}`);
   }
 }
 
@@ -159,16 +150,24 @@ async function main() {
   }
 
   build();
-  zipDist();
   if (dryRun) {
-    log("--dry-run: built and zipped only, no AWS calls made");
+    log("--dry-run: built and smoke-gated only, no git push, no AWS calls");
     return;
   }
 
+  ensureCleanTree();
   requireAwsCli();
-  const app = ensureApp();
-  ensureBranch(app.appId);
-  await deploy(app.appId);
+  const app = findApp();
+  if (!app) {
+    throw new Error(
+      `no Amplify app named "${APP_NAME}" exists. First-time setup is a one-time manual step: ` +
+        "in the Amplify console, New app → Host web app → connect the github.com/joveuh/human-atlas " +
+        "repo → branch `main`. After that, `npm run deploy` handles every deploy from here.",
+    );
+  }
+  const before = latestJobId(app.appId);
+  const pushed = push();
+  await watchNewJob(app.appId, before, pushed);
   printReport(app);
 }
 
